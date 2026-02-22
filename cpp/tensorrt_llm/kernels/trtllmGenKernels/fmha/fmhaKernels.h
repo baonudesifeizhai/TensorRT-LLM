@@ -664,6 +664,8 @@ private:
         int defaultTileSizeQ = selectKernelParamsCopy.mTileSizeQ;
         // The selected tileSizeQ.
         int selectedTileSizeQ = selectKernelParamsCopy.mTileSizeQ;
+        // Whether any candidate kernel exists in the package.
+        bool foundCandidateKernel = false;
 
         // The minimum modeling kernel time.
         float globalModelingKernelTime = FLT_MAX;
@@ -691,6 +693,11 @@ private:
             {
                 selectKernelParamsCopy.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
+            if (!isKernelAvailable(params, selectKernelParamsCopy))
+            {
+                continue;
+            }
+            foundCandidateKernel = true;
             // Load the kernel.
             std::tie(func, kernelMeta) = loadKernel(params, selectKernelParamsCopy);
 
@@ -721,6 +728,12 @@ private:
             }
         }
 
+        // Keep the default selection if no candidate is available.
+        if (!foundCandidateKernel)
+        {
+            return;
+        }
+
         // Update the tileSizeQ.
         selectKernelParams.mTileSizeQ = selectedTileSizeQ;
         // Update the kernel type.
@@ -732,6 +745,51 @@ private:
         {
             selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
         }
+    }
+
+    void selectLegacyFp4GenerationKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
+    {
+        selectKernelParams.mTileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
+        selectKernelParams.mKernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+    }
+
+    uint64_t hashFromRunnerParamsFast(RunnerParams const& params, SelectKernelParams const& selectKernelParams) const
+    {
+        return hashID(static_cast<int>(params.mQkvLayout), static_cast<int>(selectKernelParams.mMaskType),
+            static_cast<int>(selectKernelParams.mKernelType), static_cast<int>(selectKernelParams.mTileScheduler),
+            static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
+            params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
+            selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV, selectKernelParams.mUses2CtaMma,
+            params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible);
+    }
+
+    bool isKernelAvailable(RunnerParams const& params, SelectKernelParams const& selectKernelParams) const
+    {
+        auto const hashId = hashFromRunnerParamsFast(params, selectKernelParams);
+        return mFunctions.find(hashId) != mFunctions.end();
+    }
+
+    bool selectFp4ThroughputKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
+    {
+        int constexpr kCandidateTileSizesQ[] = {128, 64, 32, 16, 8};
+        for (int const tileSizeQ : kCandidateTileSizesQ)
+        {
+            if (tileSizeQ < params.mNumHeadsQPerKv)
+            {
+                continue;
+            }
+            SelectKernelParams candidate = selectKernelParams;
+            candidate.mTileSizeQ = tileSizeQ;
+            candidate.mKernelType
+                = tileSizeQ >= 64 ? FmhaKernelType::KeepsMmaAbForGeneration : FmhaKernelType::SwapsMmaAbForGeneration;
+            if (!isKernelAvailable(params, candidate))
+            {
+                continue;
+            }
+            selectKernelParams = candidate;
+            return true;
+        }
+        return false;
     }
 
     // Selects a heuristic kernel for GQA generation.
@@ -767,10 +825,16 @@ private:
         }
 
         // Mixed precision kernels don't work with groupsTokensHeadsQ = true for now.
-        if (mDtypeQ != mDtypeKv || mDtypeOut == DATA_TYPE_E2M1)
+        bool const isFp4Out = (mDtypeOut == DATA_TYPE_E2M1);
+        if (mDtypeQ != mDtypeKv)
         {
             tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : 16;
             kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+            return;
+        }
+        if (isFp4Out && params.mMaxSeqLenQ <= 1)
+        {
+            selectLegacyFp4GenerationKernel(params, selectKernelParams);
             return;
         }
 
@@ -807,7 +871,29 @@ private:
         // tokensQ and headsQ into one CTA.
         if (params.mMaxSeqLenQ > 1)
         {
-            selectTileSizeQForGqaGeneration(params, selectKernelParams);
+            if (isFp4Out)
+            {
+                // Availability-aware FP4 throughput path: prefer larger Q tiles first.
+                if (!selectFp4ThroughputKernel(params, selectKernelParams))
+                {
+                    TLLM_LOG_WARNING(
+                        "No FP4 throughput kernel available for this config; falling back to legacy Q8/Q16 swaps "
+                        "kernel.");
+                    selectLegacyFp4GenerationKernel(params, selectKernelParams);
+                }
+            }
+            else
+            {
+                selectTileSizeQForGqaGeneration(params, selectKernelParams);
+            }
+        }
+
+        // Final safety fallback for FP4.
+        if (isFp4Out && !isKernelAvailable(params, selectKernelParams))
+        {
+            TLLM_LOG_WARNING(
+                "Selected FP4 kernel is unavailable for this config; falling back to legacy Q8/Q16 swaps kernel.");
+            selectLegacyFp4GenerationKernel(params, selectKernelParams);
         }
     }
 
